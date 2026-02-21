@@ -9,6 +9,8 @@ import { createRefreshToken } from '../utils/jwt';
 import { readAuthRequestDeviceInfo } from '../utils/device';
 
 const TWO_FACTOR_REMEMBER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const TWO_FACTOR_PROVIDER_AUTHENTICATOR = 0;
+const TWO_FACTOR_PROVIDER_REMEMBER = 5;
 
 function twoFactorRequiredResponse(message: string = 'Two factor required.'): Response {
   // Bitwarden clients rely on these fields to trigger the 2FA UI flow.
@@ -16,9 +18,15 @@ function twoFactorRequiredResponse(message: string = 'Two factor required.'): Re
     {
       error: 'invalid_grant',
       error_description: message,
-      TwoFactorProviders: [0],
+      TwoFactorProviders: [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)],
       TwoFactorProviders2: {
-        '0': null,
+        [String(TWO_FACTOR_PROVIDER_AUTHENTICATOR)]: null,
+      },
+      // Required by current Android parser (nullable value is acceptable).
+      SsoEmail2faSessionToken: null,
+      // Keep payload shape close to upstream implementations.
+      MasterPasswordPolicy: {
+        Object: 'masterPasswordPolicy',
       },
       ErrorModel: {
         Message: message,
@@ -43,6 +51,21 @@ async function recordFailedLoginAndBuildResponse(
     );
   }
   return identityErrorResponse(message, 'invalid_grant', 400);
+}
+
+async function recordFailedTwoFactorAndBuildResponse(
+  rateLimit: RateLimitService,
+  loginIdentifier: string
+): Promise<Response> {
+  const failed = await rateLimit.recordFailedLogin(loginIdentifier);
+  if (failed.locked) {
+    return identityErrorResponse(
+      `Too many failed login attempts. Account locked for ${Math.ceil(failed.retryAfterSeconds! / 60)} minutes.`,
+      'TooManyRequests',
+      429
+    );
+  }
+  return identityErrorResponse('Two-step token is invalid. Try again.', 'invalid_grant', 400);
 }
 
 // POST /identity/connect/token
@@ -106,50 +129,52 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
       );
     }
 
-    if (deviceInfo.deviceIdentifier) {
-      await storage.upsertDevice(user.id, deviceInfo.deviceIdentifier, deviceInfo.deviceName, deviceInfo.deviceType);
-    }
-
     // Optional 2FA: enabled only when TOTP_SECRET is configured in Workers env.
     let trustedTwoFactorTokenToReturn: string | undefined;
     if (isTotpEnabled(env.TOTP_SECRET)) {
       const normalizedTwoFactorProvider = String(twoFactorProvider ?? '').trim();
-      if (normalizedTwoFactorProvider !== '' && normalizedTwoFactorProvider !== '0') {
-        return identityErrorResponse('Unsupported two-factor provider', 'invalid_grant', 400);
-      }
-
+      const normalizedTwoFactorToken = String(twoFactorToken ?? '').trim();
       const rememberRequested = ['1', 'true', 'True', 'TRUE', 'on', 'yes', 'Yes', 'YES'].includes(String(twoFactorRemember || '').trim());
+      const hasProvider = normalizedTwoFactorProvider.length > 0;
+      const hasToken = normalizedTwoFactorToken.length > 0;
 
-      // Bitwarden may reuse twoFactorToken as a remembered-device token on subsequent logins.
-      let passedByRememberToken = false;
-      if (twoFactorToken && !/^\d{6}$/.test(twoFactorToken) && deviceInfo.deviceIdentifier) {
-        const trustedUserId = await storage.getTrustedTwoFactorDeviceTokenUserId(
-          twoFactorToken,
-          deviceInfo.deviceIdentifier
-        );
-        passedByRememberToken = trustedUserId === user.id;
-      }
-
-      if (!passedByRememberToken && !twoFactorToken) {
+      // Upstream-compatible behavior: if 2FA is required and either provider or token is missing,
+      // respond with a 2FA challenge payload.
+      if (!hasProvider || !hasToken) {
         return twoFactorRequiredResponse();
       }
 
-      if (!passedByRememberToken) {
-        const totpOk = await verifyTotpToken(env.TOTP_SECRET!, twoFactorToken);
-        if (!totpOk) {
-          const failed = await rateLimit.recordFailedLogin(loginIdentifier);
-          if (failed.locked) {
-            return identityErrorResponse(
-              `Too many failed login attempts. Account locked for ${Math.ceil(failed.retryAfterSeconds! / 60)} minutes.`,
-              'TooManyRequests',
-              429
-            );
-          }
-          return identityErrorResponse('Invalid two-factor token', 'invalid_grant', 400);
-        }
+      const parsedProvider = Number.parseInt(normalizedTwoFactorProvider, 10);
+      if (!Number.isFinite(parsedProvider)) {
+        return twoFactorRequiredResponse();
       }
 
-      if (rememberRequested && deviceInfo.deviceIdentifier) {
+      let passedByRememberToken = false;
+      if (parsedProvider === TWO_FACTOR_PROVIDER_REMEMBER) {
+        if (deviceInfo.deviceIdentifier) {
+          const trustedUserId = await storage.getTrustedTwoFactorDeviceTokenUserId(
+            normalizedTwoFactorToken,
+            deviceInfo.deviceIdentifier
+          );
+          passedByRememberToken = trustedUserId === user.id;
+        }
+
+        // Remember token missing/invalid/expired should re-enter the 2FA challenge flow.
+        if (!passedByRememberToken) {
+          return twoFactorRequiredResponse();
+        }
+      } else if (parsedProvider === TWO_FACTOR_PROVIDER_AUTHENTICATOR) {
+        const totpOk = await verifyTotpToken(env.TOTP_SECRET!, normalizedTwoFactorToken);
+        if (!totpOk) {
+          return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+        }
+      } else {
+        // Unsupported provider for this server profile behaves as an invalid 2FA attempt.
+        return recordFailedTwoFactorAndBuildResponse(rateLimit, loginIdentifier);
+      }
+
+      // Upstream behavior: do not issue a new remember token when auth itself used remember provider.
+      if (rememberRequested && !passedByRememberToken && deviceInfo.deviceIdentifier) {
         trustedTwoFactorTokenToReturn = createRefreshToken();
         await storage.saveTrustedTwoFactorDeviceToken(
           trustedTwoFactorTokenToReturn,
@@ -158,6 +183,11 @@ export async function handleToken(request: Request, env: Env): Promise<Response>
           Date.now() + TWO_FACTOR_REMEMBER_TTL_MS
         );
       }
+    }
+
+    // Persist device only after successful password + (optional) 2FA verification.
+    if (deviceInfo.deviceIdentifier) {
+      await storage.upsertDevice(user.id, deviceInfo.deviceIdentifier, deviceInfo.deviceName, deviceInfo.deviceType);
     }
 
     // Successful login - clear failed attempts
