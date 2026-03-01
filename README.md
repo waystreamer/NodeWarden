@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  运行在 Cloudflare Workers 的 Bitwarden 第三方服务端，兼容官方客户
+  运行在 Cloudflare Workers 的 Bitwarden 第三方服务端，兼容官方客户端
 </p>
 
 [![Powered by Cloudflare](https://img.shields.io/badge/Powered%20by-Cloudflare-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
